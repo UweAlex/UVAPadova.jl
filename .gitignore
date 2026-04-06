@@ -1,0 +1,42 @@
+# Julia specific
+*.jl.cov
+*.jl.mem
+Manifest.toml
+deps/build.log
+
+# Compiled files
+*.o
+*.so
+*.dylib
+*.dll
+
+# Temporary / backup files
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# Project specific temporary files
+archiv.*
+full.jl
+reorganize.jl
+push.bat
+*.bat
+
+# Reference data generation
+reference_data/
+
+# Environment / OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+
+# Jupyter / Python cache (falls du mal Python nutzt)
+__pycache__/
+*.py[cod]
