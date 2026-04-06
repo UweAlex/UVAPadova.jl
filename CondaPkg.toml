@@ -1,0 +1,6 @@
+[deps]
+python = ">=3.10,<3.12"
+setuptools = "<70"
+
+[pip.deps]
+simglucose = ""

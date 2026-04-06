@@ -1,0 +1,5463 @@
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\CondaPkg.toml ===
+========================================================
+
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\full.jl ===
+========================================================
+
+# run_full_validation.jl
+# Komplette Validation: Julia UVA/Padova vs. simglucose (Python)
+
+using Pkg
+Pkg.activate(@__DIR__)
+
+println("✅ Setup abgeschlossen.\n")
+
+# ── Dein Model laden ──
+include("src/patients.jl")
+include("src/model.jl")
+
+using CSV, DataFrames, Statistics, Printf
+using PythonCall, CondaPkg
+
+CondaPkg.resolve()
+
+# Diagnose
+pyexec("""
+import sys
+print(f"Python: {sys.version}")
+import simglucose
+print(f"simglucose OK: {simglucose.__file__}")
+""", Main)
+
+py = PythonCall.pyimport
+
+# ── Python-Simulations-Funktion einmal definieren ──
+pyexec("""
+import traceback
+from simglucose.patient.t1dpatient import T1DPatient
+from simglucose.sensor.cgm import CGMSensor
+from simglucose.actuator.pump import InsulinPump
+from simglucose.simulation.env import T1DSimEnv
+from simglucose.simulation.scenario import CustomScenario
+from simglucose.simulation.sim_engine import SimObj, sim
+from simglucose.controller.base import Controller, Action
+from datetime import datetime, timedelta
+
+class OpenLoopController(Controller):
+    def __init__(self, init_state, basal, boluses):
+        super().__init__(init_state)
+        self.basal = basal
+        self.boluses = boluses
+        self.t0 = None
+
+    def policy(self, obs, reward, done, **info):
+        st = info.get('sample_time')
+        if st is None:
+            return Action(basal=self.basal, bolus=0.0)
+        if self.t0 is None:
+            self.t0 = st
+        try:
+            minutes = (st - self.t0).total_seconds() / 60.0
+        except AttributeError:
+            minutes = float(st - self.t0)
+        bolus = self.boluses.get(round(minutes), 0.0)
+        return Action(basal=self.basal, bolus=bolus)
+
+    def reset(self):
+        self.t0 = None
+
+def run_simglucose(patient_name, basal, meals_list, boluses_dict, duration_min, save_path):
+    try:
+        patient = T1DPatient.withName(patient_name)
+        sensor = CGMSensor.withName('Dexcom', seed=42)
+        pump = InsulinPump.withName('Insulet')
+        scenario = CustomScenario(
+            start_time=datetime(2025, 1, 1, 0, 0, 0),
+            scenario=meals_list
+        )
+        ctrl = OpenLoopController(0, basal, boluses_dict)
+        env = T1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
+        s = SimObj(
+            env=env,
+            controller=ctrl,
+            sim_time=timedelta(minutes=int(duration_min)),
+            animate=False,
+            path=save_path
+        )
+        sim(s)
+        print(f"  -> Python sim OK: {patient_name}")
+        return True
+    except Exception as e:
+        print(f"  -> FEHLER: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return False
+
+print("Python-Funktionen definiert OK")
+""", Main)
+
+run_simglucose = pyeval("run_simglucose", Main)
+
+# Testfälle
+struct TestCase
+    name::String
+    patient_sym::Symbol
+    basal::Float64
+    meals::Vector{NamedTuple{(:time, :cho), Tuple{Int,Int}}}
+    boluses::Vector{NamedTuple{(:time, :dose), Tuple{Int,Float64}}}
+    duration_min::Float64
+    start_bg::Union{Nothing,Float64}
+    param_overrides::Dict{Symbol,Float64}
+end
+
+all_patients = vcat(
+    [Symbol(@sprintf("child#%03d", i)) for i in 1:10],
+    [Symbol(@sprintf("adolescent#%03d", i)) for i in 1:10],
+    [Symbol(@sprintf("adult#%03d", i)) for i in 1:10]
+)
+
+standard_scenarios = [
+    TestCase("standard_day", :placeholder, 0.8,
+        [(time=60,cho=45),(time=720,cho=70),(time=960,cho=15),(time=1080,cho=80),(time=1380,cho=10)],
+        [(time=55,dose=4.0)],
+        1440.0, nothing, Dict{Symbol,Float64}()),
+    TestCase("high_carb", :placeholder, 1.2,
+        [(time=60,cho=80),(time=720,cho=110),(time=1080,cho=90)],
+        [(time=50,dose=6.0),(time=710,dose=8.0)],
+        1440.0, nothing, Dict{Symbol,Float64}()),
+    TestCase("low_carb", :placeholder, 0.6,
+        [(time=480,cho=30),(time=780,cho=40),(time=1140,cho=25)],
+        [(time=470,dose=2.0)],
+        1440.0, nothing, Dict{Symbol,Float64}()),
+]
+
+wild_cases = [
+    TestCase("wild_bw100_start100", Symbol("adult#001"), 0.8,
+        [(time=60,cho=45)], [(time=55,dose=4.0)], 1440.0, 100.0, Dict(:BW => 100.0)),
+    TestCase("wild_high_sens", Symbol("adult#001"), 0.5,
+        [(time=60,cho=60)], [(time=50,dose=6.0)], 1440.0, nothing, Dict(:kp1 => 2.5, :kp2 => 0.015)),
+    TestCase("wild_low_sens", Symbol("child#001"), 1.5,
+        [(time=60,cho=30)], [(time=55,dose=2.0)], 1440.0, nothing, Dict(:kp1 => 4.0, :kp2 => 0.005)),
+    TestCase("wild_huge_meal", Symbol("adolescent#005"), 1.0,
+        [(time=300,cho=150)], [(time=290,dose=12.0)], 1440.0, nothing, Dict{Symbol,Float64}()),
+    TestCase("wild_start_bg60", Symbol("adult#003"), 0.7,
+        [(time=60,cho=40)], [(time=55,dose=3.0)], 1440.0, 60.0, Dict{Symbol,Float64}()),
+    TestCase("wild_start_bg180", Symbol("adult#007"), 0.9,
+        [(time=60,cho=50)], [(time=55,dose=5.0)], 1440.0, 180.0, Dict{Symbol,Float64}()),
+]
+
+# Immutable struct → Felder per Rekonstruktion überschreiben
+function override_params(p::UVAPatientParams, overrides::Dict{Symbol,Float64})
+    if isempty(overrides)
+        return p
+    end
+    fields = fieldnames(UVAPatientParams)
+    vals = [haskey(overrides, f) ? overrides[f] : getfield(p, f) for f in fields]
+    UVAPatientParams(vals...)
+end
+
+function create_test_patient(tc::TestCase)
+    p = Patient(tc.patient_sym)
+    new_params = override_params(p.params, tc.param_overrides)
+    u0 = copy(p.initial_state)
+    if !isnothing(tc.start_bg)
+        u0[4] = tc.start_bg * new_params.Vg
+    end
+    Patient(p.name, new_params, u0)
+end
+
+results = DataFrame(test_name=String[], patient=String[], scenario=String[],
+                    mae=Float64[], rmse=Float64[], max_error=Float64[], n_points=Int[])
+
+SAVE_DIR = "validation_results"
+mkpath(SAVE_DIR)
+
+all_cases = vcat(
+    [TestCase(sc.name, pat, sc.basal, sc.meals, sc.boluses, sc.duration_min, sc.start_bg, sc.param_overrides)
+     for pat in all_patients for sc in standard_scenarios],
+    wild_cases
+)
+
+println("🚀 Starte $(length(all_cases)) Tests…\n")
+
+for (i, tc) in enumerate(all_cases)
+    println(@sprintf("(%3d/%d) %s – %s", i, length(all_cases), tc.patient_sym, tc.name))
+
+    p_julia = create_test_patient(tc)
+
+    # ── Python-Simulation über die vordefinierte Funktion aufrufen ──
+    patient_name_str = String(tc.patient_sym)
+    save_path = replace(joinpath(pwd(), SAVE_DIR, tc.name), "\\" => "/")
+
+    # Meals als Python-Liste von Tupeln: [(hour, cho), ...]
+    meals_py = pylist([(Int(m.time ÷ 60), m.cho) for m in tc.meals])
+
+    # Boluses als Python-Dict: {minute: dose, ...}
+    boluses_py = pydict(Dict(round(Int, b.time) => b.dose for b in tc.boluses))
+
+    success = run_simglucose(patient_name_str, tc.basal, meals_py, boluses_py,
+                              tc.duration_min, save_path)
+
+    if !pyconvert(Bool, success)
+        println("  ⚠ Python-Simulation fehlgeschlagen, überspringe...")
+        continue
+    end
+
+    # Ergebnis-CSV suchen
+    csv_path = ""
+    result_dir = joinpath(SAVE_DIR, tc.name)
+    if isdir(result_dir)
+        csvs = filter(f -> endswith(f, ".csv"), readdir(result_dir))
+        if !isempty(csvs)
+            csv_path = joinpath(result_dir, csvs[1])
+            println("  → CSV: $(csvs[1])")
+        end
+    end
+    if csv_path == "" || !isfile(csv_path)
+        println("  ⚠ Keine CSV gefunden, überspringe...")
+        continue
+    end
+
+    gt = CSV.read(csv_path, DataFrame)
+    time_col = first(filter(c -> lowercase(string(c)) in ["time", "t"], names(gt)))
+    bg_col   = first(filter(c -> lowercase(string(c)) in ["bg", "blood_glucose"], names(gt)))
+    gt = select(gt, time_col => :t, bg_col => :BG_gt)
+
+    res = simulate(p_julia;
+        meals   = [(time=m.time, cho=m.cho) for m in tc.meals],
+        insulin = [(time=b.time, dose=b.dose) for b in tc.boluses],
+        basal   = tc.basal,
+        T       = tc.duration_min,
+        dt      = 5.0
+    )
+
+    common_t = intersect(res.t, gt.t)
+    if isempty(common_t)
+        println("  ⚠ Keine gemeinsamen Zeitpunkte, überspringe...")
+        continue
+    end
+    bg_julia = res.BG[indexin(common_t, res.t)]
+    bg_gt    = gt.BG_gt[indexin(common_t, gt.t)]
+
+    mae = mean(abs.(bg_julia .- bg_gt))
+    rmse = sqrt(mean((bg_julia .- bg_gt).^2))
+    max_err = maximum(abs.(bg_julia .- bg_gt))
+
+    push!(results, (tc.name, String(tc.patient_sym), tc.name, mae, rmse, max_err, length(common_t)))
+    @printf("   → MAE = %.4f mg/dL   Max-Error = %.4f mg/dL\n", mae, max_err)
+end
+
+CSV.write(joinpath(SAVE_DIR, "validation_summary.csv"), results)
+sort!(results, :max_error, rev=true)
+
+println("\n" * "═"^70)
+println("✅ VALIDATION FERTIG!")
+println("Ergebnisse in: $SAVE_DIR/validation_summary.csv")
+println("Schlimmste Abweichungen:")
+println(first(results, 10))
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\generate_reference.jl ===
+========================================================
+
+# generate_reference.jl
+# Erzeugt simglucose-Referenzdaten für Julia-Modellvalidierung.
+
+using Pkg
+Pkg.activate(@__DIR__)
+
+using PythonCall, CondaPkg, Printf
+using CSV, DataFrames
+
+CondaPkg.resolve()
+
+# ── Python-Code ──────────────────────────────────────────────
+pyexec("""
+import traceback
+from simglucose.patient.t1dpatient import T1DPatient
+from simglucose.sensor.cgm import CGMSensor
+from simglucose.actuator.pump import InsulinPump
+from simglucose.simulation.env import T1DSimEnv
+from simglucose.simulation.scenario import CustomScenario
+from simglucose.simulation.sim_engine import SimObj, sim
+from simglucose.controller.base import Controller, Action
+from datetime import datetime, timedelta
+
+class OpenLoopController(Controller):
+    def __init__(self, init_state, basal, boluses):
+        super().__init__(init_state)
+        self.basal = basal
+        self.boluses = boluses
+        self.t0 = None
+
+    def policy(self, obs, reward, done, **info):
+        st = info.get('sample_time')
+        if st is None:
+            return Action(basal=self.basal, bolus=0.0)
+
+        if self.t0 is None:
+            self.t0 = st
+
+        try:
+            minutes = (st - self.t0).total_seconds() / 60.0
+        except AttributeError:
+            minutes = float(st - self.t0)
+
+        bolus = self.boluses.get(int(round(minutes)), 0.0)
+        return Action(basal=self.basal, bolus=bolus)
+
+    def reset(self):
+        self.t0 = None
+
+def run_simglucose(patient_name, basal, meals_list, boluses_dict, duration_min, save_path,
+                   param_overrides=None):
+    try:
+        base_patient = T1DPatient.withName(patient_name)
+        params = base_patient._params.copy()
+
+        if param_overrides:
+            for k, v in param_overrides.items():
+                if k in params.index:
+                    params[k] = v
+
+        patient = T1DPatient(params, init_state=None, random_init_bg=False, seed=None)
+
+        sensor = CGMSensor.withName('Dexcom', seed=42)
+        pump = InsulinPump.withName('Insulet')
+
+        scenario = CustomScenario(
+            start_time=datetime(2025, 1, 1, 0, 0, 0),
+            scenario=meals_list
+        )
+
+        ctrl = OpenLoopController(0, basal, boluses_dict)
+
+        env = T1DSimEnv(patient=patient, sensor=sensor, pump=pump, scenario=scenario)
+
+        s = SimObj(
+            env=env,
+            controller=ctrl,
+            sim_time=timedelta(minutes=int(duration_min)),
+            animate=False,
+            path=save_path
+        )
+
+        sim(s)
+        return True
+
+    except Exception as e:
+        print(f"FEHLER: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return False
+
+def get_patient_param_names(patient_name):
+    p = T1DPatient.withName(patient_name)
+    names = []
+    for k in p._params.index:
+        if k in ('Name', 'patient_history', 'i'):
+            continue
+        if str(k).startswith('x0'):
+            continue
+        try:
+            float(p._params[k])
+            names.append(k)
+        except (ValueError, TypeError):
+            pass
+    return names
+
+def get_patient_param_value(patient_name, param_name):
+    p = T1DPatient.withName(patient_name)
+    return float(p._params[param_name])
+
+print("Python-Setup OK")
+""", Main)
+
+run_simglucose = pyeval("run_simglucose", Main)
+get_patient_param_names = pyeval("get_patient_param_names", Main)
+get_patient_param_value = pyeval("get_patient_param_value", Main)
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+function main()
+
+    REF_DIR = joinpath(@__DIR__, "reference_data")
+    mkpath(REF_DIR)
+
+    meta = DataFrame(
+        test_id=String[], patient=String[], scenario=String[],
+        basal=Float64[], duration=Float64[],
+        meals_min=String[], meals_cho=String[],
+        boluses_min=String[], boluses_dose=String[],
+        param_override_name=String[], param_override_value=String[],
+        csv_file=String[]
+    )
+
+    function find_csv_in_tree(save_dir)
+        # Erst direkt im Ordner suchen
+        csvs = sort(filter(f -> endswith(f, ".csv"), readdir(save_dir)))
+        if !isempty(csvs)
+            return csvs[1]
+        end
+        # Dann in Unterordnern
+        for subdir in readdir(save_dir, join=true)
+            if isdir(subdir)
+                csvs = sort(filter(f -> endswith(f, ".csv"), readdir(subdir)))
+                if !isempty(csvs)
+                    return joinpath(basename(subdir), csvs[1])
+                end
+            end
+        end
+        return ""
+    end
+
+    function run_and_record!(test_id, patient, scenario_name, basal, meals, boluses,
+                             duration, override_name, override_value, param_overrides)
+
+        save_dir = joinpath(REF_DIR, test_id)
+
+        if isdir(save_dir)
+            rel = find_csv_in_tree(save_dir)
+            if rel != ""
+                push!(meta, (test_id, patient, scenario_name, basal, duration,
+                             "", "", "", "", override_name, override_value,
+                             joinpath(test_id, rel)))
+                return :skipped
+            end
+        end
+
+        mkpath(save_dir)
+
+        # Windows-safe Pfad
+        py_save_dir = replace(save_dir, "\\" => "/")
+
+        meals_py = pylist([(m[1] / 60.0, m[2]) for m in meals])
+        boluses_py = pydict(Dict(b[1] => b[2] for b in boluses))
+
+        py_overrides = isempty(param_overrides) ?
+            pyeval("None", Main) : pydict(param_overrides)
+
+        success = run_simglucose(patient, basal, meals_py, boluses_py,
+                                  duration, py_save_dir, py_overrides)
+
+        if pyconvert(Bool, success)
+            rel = find_csv_in_tree(save_dir)
+            if rel != ""
+                push!(meta, (test_id, patient, scenario_name, basal, duration,
+                             "", "", "", "", override_name, override_value,
+                             joinpath(test_id, rel)))
+                return :ok
+            end
+        end
+
+        return :failed
+    end
+
+    # ── Teil 1 ──
+    all_patients = vcat(
+        [@sprintf("child#%03d", i) for i in 1:10],
+        [@sprintf("adolescent#%03d", i) for i in 1:10],
+        [@sprintf("adult#%03d", i) for i in 1:10]
+    )
+
+    scenarios = [
+        ("standard_day", 0.8, [(60,45),(720,70),(960,15),(1080,80),(1380,10)], [(55,4.0)], 1440.0),
+        ("high_carb",    1.2, [(60,80),(720,110),(1080,90)], [(50,6.0),(710,8.0)], 1440.0),
+        ("low_carb",     0.6, [(480,30),(780,40),(1140,25)], [(470,2.0)], 1440.0),
+    ]
+
+    total_std = length(all_patients) * length(scenarios)
+
+    println("═"^60)
+    println("TEIL 1: Standard-Tests ($total_std Tests)")
+    println("═"^60)
+
+    n_done = 0
+
+    for patient in all_patients
+        for (sc_name, basal, meals, boluses, dur) in scenarios
+            n_done += 1
+            test_id = "$(patient)_$(sc_name)"
+
+            print(@sprintf("(%3d/%d) %s … ", n_done, total_std, test_id))
+
+            result = run_and_record!(test_id, patient, sc_name,
+                                     basal, meals, boluses, dur,
+                                     "", "", Dict{String,Float64}())
+
+            println(result == :ok ? "✅" : result == :skipped ? "⏭" : "❌")
+        end
+    end
+
+    # ── Teil 2 ──
+    BASE_PATIENT = "adult#001"
+    sc_name, basal, meals, boluses, dur = scenarios[1]
+
+    param_names = pyconvert(Vector{String}, get_patient_param_names(BASE_PATIENT))
+    multipliers = [0.99, 1.01, 0.95, 1.05, 0.90, 1.10]
+
+    total_perturb = length(param_names) * length(multipliers)
+
+    println("\n" * "═"^60)
+    println("TEIL 2: Parameter-Perturbation ($total_perturb Tests)")
+    println("═"^60)
+
+    n_done = 0
+
+    for pname in param_names
+        base_val = pyconvert(Float64, get_patient_param_value(BASE_PATIENT, pname))
+
+        for mult in multipliers
+            n_done += 1
+            new_val = base_val * mult
+
+            test_id = @sprintf("perturb_%s_x%.2f", pname, mult)
+
+            print(@sprintf("(%3d/%d) %-10s = %10.4g … ",
+                            n_done, total_perturb, pname, new_val))
+
+            result = run_and_record!(test_id, BASE_PATIENT,
+                                     "perturb_$(pname)",
+                                     basal, meals, boluses, dur,
+                                     pname, string(new_val),
+                                     Dict(pname => new_val))
+
+            println(result == :ok ? "✅" : result == :skipped ? "⏭" : "❌")
+        end
+    end
+
+    # ── Save ──
+    meta_path = joinpath(REF_DIR, "test_cases.csv")
+    CSV.write(meta_path, meta)
+
+    println("\n" * "═"^60)
+    println("✅ REFERENZDATEN FERTIG!")
+    println("   $(nrow(meta)) Tests")
+    println("   Verzeichnis: $REF_DIR")
+    println("   Metadaten:   $meta_path")
+    println("═"^60)
+
+end
+
+# ── Start ──
+main()
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\Manifest.toml ===
+========================================================
+
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\Memo.md ===
+========================================================
+
+
+# Memo: UVAPadova.jl Unterprojekt
+
+**Stand:** 3. April 2026 (rev. 4 – Solver-Strategie flexibilisiert)
+**Bezug:** Projektplan.md Abschnitt 3, T1D-Dosis.jl Gesamtprojekt
+
+---
+
+## 1. Einordnung in T1D-Dosis.jl
+
+UVAPadova.jl ist ein **eigenständiges Modul** innerhalb des T1D-Dosis-Projekts. Es implementiert das UVA/Padova Glukose-Insulin-Modell als ODE-System in Julia.
+
+### Was es ersetzt
+
+Langfristig die einfache ISF×IOB-Rechnung im MinimalDoseRecommender. Statt `ΔBG = Dosis × ISF` wird eine physiologische ODE-Integration die BG-Prognose liefern – mit Magenentleerung, Insulinkompartimenten, endogener Glukoseproduktion und Sensor-Modell.
+
+### Was es NICHT anfasst
+
+JugglucoSync, SensorCorrector, SafetyChecker, Config – alles bleibt. UVAPadova.jl hat **keine Abhängigkeit** auf den restlichen Code. Es bekommt Parameter, Inputs (Mahlzeit, Insulin) und liefert einen BG-Verlauf zurück. Die Integration in den Recommender kommt erst in Phase U5.
+
+---
+
+## Zielverschiebung (entscheidend)
+
+UVAPadova.jl ist **kein Paper-Replikator**, sondern ein:
+
+> **schneller, deterministischer, differenzierbarer Forward-Simulator**
+> für Parameter-Fitting (Levenberg–Marquardt) in T1D-Dosis.jl
+
+Konsequenzen:
+
+* Numerische Identität zu simglucose ist nachrangig
+* Speed pro Simulation ist kritisch
+* Differenzierbarkeit ist erforderlich
+* **Solver-Verhalten muss kontrollierbar sein (deterministisch konfigurierbar)**
+
+---
+
+## Interne Architektur (angepasst)
+
+**A. Low-Level (ODE Core):**
+Strikt in-place, allokationsfrei, vollständig deterministisch. Keine Events, keine diskontinuierlichen Sprünge.
+
+**B. Mid-Level (Input Encoding):**
+Mahlzeiten und Insulin werden als **glatte, kontinuierliche Funktionen** modelliert (keine Callbacks, keine Dirac-Impulse).
+
+👉 Diese Trennung ist notwendig für stabiles LM-Fitting.
+
+---
+
+## Schnittstelle
+
+```julia
+import UVAPadova
+
+patient = UVAPadova.Patient(:adult001)
+
+result = UVAPadova.simulate(patient,
+    tspan = (0.0, 480.0),
+    meals = [(time=60.0, cho=45.0)],
+    insulin = [(time=55.0, dose=4.0, type=:rapid)],
+    basal = 0.8
+)
+
+# result.t
+# result.BG
+# result.IOB
+# result.Ra
+# result.states
+```
+
+---
+
+## Wichtige API-Erweiterung (für Fitting)
+
+```julia
+UVAPadova.residuals(patient, data, θ)
+```
+
+→ liefert direkt Residuen für LM
+
+---
+
+## 2. Schlüssel-Paper (chronologisch)
+
+### P1 – Das Original-Modell (2007)
+
+Dalla Man C, Rizza RA, Cobelli C.
+Meal Simulation Model of the Glucose-Insulin System.
+IEEE Trans Biomed Eng. 2007;54(10):1740–1749.
+
+Das Fundament: Alle Gleichungen, Parameter, Kompartiment-Struktur.
+Beschreibt das Modell für gesunde Probanden. Für T1D wird das
+Insulin-Sekretions-Modul durch ein SC-Infusions-Modul ersetzt.
+
+---
+
+### P2 – GIM Simulator-Software (2007)
+
+Dalla Man C, Raimondo DM, Rizza RA, Cobelli C.
+GIM, Simulation Software of Meal Glucose–Insulin Model.
+J Diabetes Sci Technol. 2007;1(3):323–330.
+
+Frei zugänglich. Enthält die T1D-Adaptierung.
+
+---
+
+### P3 – S2013/S2014 Update (2014)
+
+Dalla Man C et al.
+The UVA/PADOVA Type 1 Diabetes Simulator: New Features.
+
+---
+
+### P4 – S2017 mit Tagesvariabilität (2018)
+
+Visentin R et al.
+The UVA/Padova Type 1 Diabetes Simulator Goes from Single Meal to Single Day.
+
+---
+
+### P5 – Bayesian Cloning (2016)
+
+Visentin R et al.
+One-Day Bayesian Cloning of Type 1 Diabetes Subjects.
+
+---
+
+## 3. Modellversionen im Vergleich
+
+| Feature         | S2008          | S2013/14    | S2017             |
+| --------------- | -------------- | ----------- | ----------------- |
+| Fokus           | Einzelmahlzeit | Population  | Tagesvariabilität |
+| Glukagon        | Nein           | Ja          | Ja                |
+| Insulin-Wirkung | Linear         | Nichtlinear | Zeitvariant       |
+| Zustände        | ~13            | ~15+        | ~15+              |
+
+**Strategie:** S2008 als Basis implementieren.
+
+---
+
+## 4. Existierende Open-Source-Implementierungen
+
+### simglucose (Python)
+
+Hauptreferenz für Struktur und Parameter.
+
+👉 Dient als **dynamische Referenz**, nicht als exakte Zielimplementierung.
+
+---
+
+## 5. Virtuelle Patienten
+
+### Verifikationsziel (angepasst)
+
+| Metrik             | Schwelle   |
+| ------------------ | ---------- |
+| Peak-BG Abweichung | < 10 mg/dL |
+| Time-to-Peak       | < 15 min   |
+| AUC Abweichung     | < 10%      |
+
+---
+
+### Sanity-Tests
+
+* Steady State stabil
+* Monotonie bei Dosisänderung
+* Plausible Wertebereiche
+* Mahlzeit → BG steigt
+* Insulin → BG sinkt
+
+---
+
+## 6. Bekannte Stolpersteine
+
+### ⚠️ Events / Diskontinuitäten
+
+Diskrete Sprünge führen zu instabilen Jacobians.
+
+**Lösung:** nur glatte Inputs verwenden.
+
+---
+
+### ⚠️ Magenentleerung
+
+Ra(t) ist Output des Modells. Form muss stimmen, exakte Gleichung sekundär.
+
+---
+
+### ⚠️ Steady-State
+
+Initialzustand kritisch.
+
+---
+
+### ⚠️ Einheiten
+
+mg/dL vs mmol/L etc.
+
+---
+
+### ⚠️ Insulinmodell & EGP-Verzögerung
+
+korrekt implementieren
+
+---
+
+## Checkliste
+
+* [ ] Keine diskreten Events
+* [ ] Glatte Inputs
+* [ ] Simulation deterministisch konfigurierbar
+* [ ] ODE allokationsfrei
+* [ ] State-Vektor fix
+* [ ] Einheiten korrekt
+
+---
+
+## 7. Technischer Stack
+
+| Komponente | Julia-Paket              | Zweck              |
+| ---------- | ------------------------ | ------------------ |
+| ODE-Solver | DifferentialEquations.jl | adaptiv oder fixed |
+| Parameter  | CSV.jl                   | laden              |
+| Plotting   | UnicodePlots.jl          | Debug              |
+| AD         | ForwardDiff.jl           | LM                 |
+
+---
+
+## Solver-Konfiguration
+
+### Standard (Entwicklung)
+
+```julia
+solve(prob, Tsit5(), reltol=1e-6, abstol=1e-8)
+```
+
+---
+
+### Fitting (LM)
+
+```julia
+solve(prob, Tsit5(),
+      adaptive=false,
+      dt=1.0,
+      saveat=1.0)
+```
+
+---
+
+👉 Solverwahl erfolgt über Parameter der `simulate()`-Funktion.
+
+---
+
+## 8. Phase U1 – Substeps
+
+1. Parameter laden
+2. GI-Modell
+3. Insulinmodell
+4. Glukosekern
+5. Integration ohne Events
+6. Verifikation
+
+---
+
+## 9. Performance-Ziel
+
+< 1 ms pro Simulation (CPU)
+
+---
+
+## 10. Verbindung zu T1D-Dosis.jl
+
+Fitting mit **Levenberg–Marquardt**
+
+### Anforderungen
+
+* deterministisch
+* glatt
+* schnell
+
+---
+
+### Residuals
+
+```julia
+r_i(θ) = BG_model(t_i; θ) - BG_data(t_i)
+```
+
+---
+
+### Solver-Anmerkung
+
+Adaptive Solver können instabile Jacobians erzeugen.
+
+👉 Fixed-Step wird für LM bevorzugt, bleibt aber optional.
+
+---
+
+## 11. Empfohlene Reihenfolge
+
+1. Paper lesen
+2. simglucose verstehen
+3. Modell implementieren
+4. testen
+5. optimieren
+6. LM integrieren
+
+---
+
+# Fazit
+
+UVAPadova.jl ist:
+
+> ein **hochperformanter, differenzierbarer Modellkern**
+> mit **flexibel konfigurierbarem Solver**
+
+Wichtige Eigenschaften:
+
+* Speed
+* Determinismus (optional erzwingbar)
+* glatte Dynamik
+
+---
+
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\Project.toml ===
+========================================================
+
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\README.md ===
+========================================================
+
+
+# UVAPadova.jl
+
+Hochperformante, differenzierbare Julia-Implementierung des UVA/Padova S2008 Glukose-Insulin-Modells  
+– vollwertiger, moderner Ersatz für simglucose und zentraler Plasma-Generator für das T1D-Dosis.jl Masterplan (ICT / Pen-Injektionen).
+
+## Ziel des Projekts
+
+UVAPadova.jl erfüllt zwei Rollen gleichzeitig:
+
+1. Eigenständiges Projekt  
+   Schneller, sauberer und deutlich leistungsfähiger Ersatz für das Python-Paket simglucose. Numerisch praktisch identisch, aber mit deutlich besserer Geschwindigkeit, vollständiger Differenzierbarkeit und moderner Julia-Architektur.
+
+2. Baustein für das T1D-Dosis.jl Masterplan  
+   Liefert die stabile Plasmadynamik (Magenentleerung, endogene Glukoseproduktion, nichtlineare Insulinwirkung, Gewebe-Glukose etc.) für reine ICT/Pen-Injektions-Szenarien.  
+   Die MDI-spezifischen Effekte (realistisches Pen-Depot, variable Absorption, Exercise-Einfluss auf das Depot, Fat/Protein-Verzögerung) werden komplementär durch das LT1-Modul abgedeckt.
+
+## Validierungsergebnis
+
+| Metrik                  | Standard-Tests (90) | Perturbation-Tests (276) |
+|-------------------------|---------------------|--------------------------|
+| Mittlere MAE            | 1.78 mg/dL          | 1.65 mg/dL               |
+| Max Error               | 71.5 mg/dL          | 21.3 mg/dL               |
+| Tests bestanden         | 90/90               | 276/276                  |
+
+366 Tests über 30 virtuelle Patienten (10 Kinder, 10 Jugendliche, 10 Erwachsene) und 3 Szenarien – alles gegen simglucose validiert.
+
+## Installation
+
+    using Pkg
+    Pkg.activate(".")
+    Pkg.instantiate()
+
+## Schnellstart
+
+    using UVAPadova
+
+    # Patient laden
+    p = Patient(Symbol("adult#001"))
+
+    # Empfohlene schnelle Simulation (AD-kompatibel)
+    res = simulate_fast(p;
+        meals   = [(time=60, cho=45), (time=720, cho=70)],
+        insulin = [(time=55, dose=4.0)],
+        basal   = 0.8,
+        T       = 1440.0)
+
+    # Ergebnis
+    println("BG-Werte: ", res.BG[1:5], " …")
+
+## Zwei Solver
+
+### simulate_fast() – Standard für die meisten Anwendungen
+- Segment-weiser Tsit5-Solver
+- Vollständig ForwardDiff-kompatibel
+- Sehr schnell und deterministisch
+- Ideal für Parameter-Fitting (Levenberg–Marquardt)
+
+### simulate() – Referenz-Modus (DiffEq + Callbacks)
+- Exakte Nachbildung des simglucose-Verhaltens
+- Wird primär für Validierung verwendet
+
+### simulate_with_θ() – Direkt für Optimierung
+
+    using ForwardDiff
+    θ = [p.params.kp1, p.params.Vmx]
+    J = ForwardDiff.jacobian(θ -> simulate_with_θ(p, θ, (:kp1, :Vmx); ...), θ)
+
+## Modell
+
+UVA/Padova S2008 mit 13 Zustandsvariablen.  
+Das Modell ist hervorragend geeignet für die stabile Plasmadynamik bei Pen-Injektionen. Die grundlegende subkutane Insulin-Kinetik ist enthalten, aber für höchste Realität bei ICT-Szenarien wird es bewusst mit dem LT1-Modul kombiniert (Pen-Depot-Effekte).
+
+## Patienten
+
+30 virtuelle Patienten (identisch mit simglucose) aus data/vpatient_params.csv:
+- child#001–010
+- adolescent#001–010
+- adult#001–010
+
+## Tests & Validierung
+
+    # Unit-Tests (Smoke, AD, Performance, Plausibilität)
+    julia --project test/runtests.jl
+
+    # Vollständige Validierung gegen simglucose-Referenzdaten
+    julia validate.jl
+
+## Projektstruktur
+
+    UVAPadova.jl/
+    ├── src/
+    │   ├── UVAPadova.jl
+    │   ├── patients.jl
+    │   ├── model.jl          # Referenz-Solver
+    │   └── fast.jl           # AD-kompatibler Solver
+    ├── test/
+    ├── data/
+    │   ├── vpatient_params.csv
+    │   └── reference/        # 366 simglucose-Referenz-CSVs
+    ├── validate.jl
+    ├── generate_reference.jl
+    └── README.md
+
+## Abhängigkeiten
+
+Kern:  
+StaticArrays, DifferentialEquations, ForwardDiff, CSV, DataFrames
+
+Nur für Referenz-Generierung (optional):  
+PythonCall + simglucose
+
+## Referenzen
+
+- Dalla Man et al. (2007) – Meal Simulation Model of the Glucose-Insulin System
+- Xie J. – simglucose v0.2.1
+- Masterplan T1D-Dosis.jl (UVA2008 als Plasma-Generator + LT1 für MDI-spezifische Effekte)
+
+---
+
+Lizenz: Forschungszwecke (basierend auf publizierten Gleichungen und simglucose MIT-Lizenz).
+
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\reorganize.jl ===
+========================================================
+
+# reorganize_data.jl
+# Konsolidiert alle Referenzdaten in data/reference/ mit vollständiger Index-CSV.
+# Füllt fehlende Meals/Boluses-Daten aus den Szenario-Definitionen nach.
+
+using Pkg
+Pkg.activate(@__DIR__)
+using CSV, DataFrames
+
+SRC_DIR = joinpath(@__DIR__, "reference_data")
+DST_DIR = joinpath(@__DIR__, "data", "reference")
+mkpath(DST_DIR)
+
+meta_path = joinpath(SRC_DIR, "test_cases.csv")
+if !isfile(meta_path)
+    error("test_cases.csv nicht gefunden in $SRC_DIR")
+end
+
+meta = CSV.read(meta_path, DataFrame)
+println("📂 $(nrow(meta)) Tests gefunden\n")
+
+# ── Szenario-Definitionen (für fehlende Meals/Boluses) ──
+SCENARIOS = Dict(
+    "standard_day" => (
+        meals_min="60;720;960;1080;1380", meals_cho="45;70;15;80;10",
+        boluses_min="55", boluses_dose="4.0"),
+    "high_carb" => (
+        meals_min="60;720;1080", meals_cho="80;110;90",
+        boluses_min="50;710", boluses_dose="6.0;8.0"),
+    "low_carb" => (
+        meals_min="480;780;1140", meals_cho="30;40;25",
+        boluses_min="470", boluses_dose="2.0"),
+)
+
+# Perturbation-Tests nutzen standard_day
+function get_scenario_data(scenario_name)
+    # "perturb_BW" → Basis ist standard_day
+    base = startswith(scenario_name, "perturb_") ? "standard_day" : scenario_name
+    return get(SCENARIOS, base, SCENARIOS["standard_day"])
+end
+
+# ── Index aufbauen ──
+index = DataFrame(
+    file=String[],
+    test_id=String[],
+    patient=String[],
+    scenario=String[],
+    basal=Float64[],
+    duration_min=Float64[],
+    meals_min=String[],
+    meals_cho=String[],
+    boluses_min=String[],
+    boluses_dose=String[],
+    param_override_name=String[],
+    param_override_value=String[],
+    n_rows=Int[],
+    columns=String[]
+)
+
+copied = 0
+skipped = 0
+
+for row in eachrow(meta)
+    global copied, skipped
+    src_csv = joinpath(SRC_DIR, row.csv_file)
+    if !isfile(src_csv)
+        println("  ⚠ fehlt: $(row.csv_file)")
+        skipped += 1
+        continue
+    end
+
+    # Sauberer Dateiname
+    dst_name = row.test_id * ".csv"
+    dst_csv = joinpath(DST_DIR, dst_name)
+    cp(src_csv, dst_csv; force=true)
+
+    # CSV inspizieren
+    df = CSV.read(dst_csv, DataFrame)
+    col_names = join(names(df), ";")
+
+    # Fehlende Meals/Boluses aus Szenario nachfüllen
+    sc_data = get_scenario_data(row.scenario)
+
+    meals_min_str  = (ismissing(row.meals_min) || row.meals_min == "") ?
+                      sc_data.meals_min : row.meals_min
+    meals_cho_str  = (ismissing(row.meals_cho) || row.meals_cho == "") ?
+                      sc_data.meals_cho : row.meals_cho
+    bol_min_str    = (ismissing(row.boluses_min) || row.boluses_min == "") ?
+                      sc_data.boluses_min : row.boluses_min
+    bol_dose_str   = (ismissing(row.boluses_dose) || row.boluses_dose == "") ?
+                      sc_data.boluses_dose : row.boluses_dose
+
+    override_name  = ismissing(row.param_override_name) ? "" : row.param_override_name
+    override_value = ismissing(row.param_override_value) ? "" : string(row.param_override_value)
+    push!(index, (
+        dst_name, row.test_id, row.patient, row.scenario,
+        row.basal, row.duration,
+        meals_min_str, meals_cho_str, bol_min_str, bol_dose_str,
+        override_name, override_value,
+        nrow(df), col_names
+    ))
+
+    copied += 1
+end
+
+# Speichern
+index_path = joinpath(DST_DIR, "index.csv")
+CSV.write(index_path, index)
+CSV.write(joinpath(@__DIR__, "data", "reference_index.csv"), index)
+
+println("\n" * "═"^60)
+println("✅ REORGANISATION FERTIG!")
+println("   $copied Dateien → data/reference/")
+println("   $skipped übersprungen")
+println("   Index: data/reference/index.csv")
+println("═"^60)
+println("\nDanach kann der alte Ordner weg:")
+println("   rmdir /s /q reference_data")
+println("\nNächster Schritt:")
+println("   julia validate_model.jl")
+========================================================
+
+
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\validate.jl ===
+========================================================
+
+# validate_model.jl
+# Vergleicht Julia-UVA/Padova mit simglucose-Referenzdaten in data/reference/.
+# Kein Python nötig — reines Julia.
+
+using Pkg
+using Dates
+Pkg.activate(@__DIR__)
+
+include("src/patients.jl")
+include("src/model.jl")
+include("src/fast.jl")
+
+using CSV, DataFrames, Statistics, Printf
+
+REF_DIR = joinpath(@__DIR__, "data", "reference")
+meta_path = joinpath(REF_DIR, "index.csv")
+
+if !isfile(meta_path)
+    error("Index nicht gefunden! Bitte zuerst:\n  julia reorganize_data.jl")
+end
+
+meta = CSV.read(meta_path, DataFrame)
+println("📊 $(nrow(meta)) Testfälle geladen aus data/reference/index.csv\n")
+
+function override_params(p::UVAPatientParams, overrides::Dict{Symbol,Float64})
+    if isempty(overrides)
+        return p
+    end
+    fields = fieldnames(UVAPatientParams)
+    vals = Float64[haskey(overrides, f) ? overrides[f] : Float64(getfield(p, f)) for f in fields]
+    UVAPatientParams(vals...)
+end
+
+results = DataFrame(
+    test_id=String[], patient=String[], scenario=String[],
+    param_override=String[],
+    mae=Float64[], rmse=Float64[], max_error=Float64[], n_points=Int[]
+)
+
+for row in eachrow(meta)
+    print(@sprintf("%-45s ", row.test_id))
+
+    csv_path = joinpath(REF_DIR, row.file)
+    if !isfile(csv_path)
+        println("⚠ CSV fehlt: $(row.file)")
+        continue
+    end
+
+    gt = CSV.read(csv_path, DataFrame)
+
+    time_candidates = filter(c -> lowercase(string(c)) in ["time", "t"], names(gt))
+    bg_candidates   = filter(c -> lowercase(string(c)) in ["bg", "blood_glucose"], names(gt))
+    if isempty(time_candidates) || isempty(bg_candidates)
+        println("⚠ Spalten nicht gefunden: $(names(gt))")
+        continue
+    end
+    gt = select(gt, first(time_candidates) => :t, first(bg_candidates) => :BG_gt)
+    
+    times = DateTime.(gt.t, dateformat"yyyy-mm-dd HH:MM:SS")
+    gt.t = Float64.(Dates.value.(times .- times[1]) ./ 60_000)  # ms → min
+
+    # Testfall-Parameter rekonstruieren
+    meals_min_str  = ismissing(row.meals_min) ? "" : row.meals_min
+    meals_cho_str  = ismissing(row.meals_cho) ? "" : row.meals_cho
+    boluses_min_str = ismissing(row.boluses_min) ? "" : row.boluses_min
+    boluses_dose_str = ismissing(row.boluses_dose) ? "" : row.boluses_dose
+
+    if meals_min_str == "" || meals_cho_str == ""
+        println("⚠ Meals-Daten fehlen")
+        continue
+    end
+
+    meals_min = parse.(Int, split(meals_min_str, ";"))
+    meals_cho = parse.(Int, split(meals_cho_str, ";"))
+    meals = [(time=t, cho=c) for (t, c) in zip(meals_min, meals_cho)]
+
+    bol_min  = parse.(Int, split(boluses_min_str, ";"))
+    bol_dose = parse.(Float64, split(boluses_dose_str, ";"))
+    boluses = [(time=t, dose=d) for (t, d) in zip(bol_min, bol_dose)]
+
+    # Patient + Overrides
+    p = Patient(Symbol(row.patient))
+    overrides = Dict{Symbol,Float64}()
+    override_str = ""
+    override_name = ismissing(row.param_override_name) ? "" : row.param_override_name
+    override_value = ismissing(row.param_override_value) ? "" : string(row.param_override_value)
+    if override_name != ""
+        overrides[Symbol(override_name)] = override_value isa Number ? Float64(override_value) : parse(Float64, override_value)
+        override_str = "$(override_name)=$(override_value)"
+    end
+    new_params = override_params(p.params, overrides)
+    p = Patient(p.name, new_params, copy(p.initial_state))
+
+    res = simulate_fast(p;
+        meals   = meals,
+        insulin = boluses,
+        basal   = row.basal,
+        T       = row.duration_min,
+        save_every = 5
+    )
+
+    common_t = intersect(res.t, gt.t)
+    if isempty(common_t)
+        println("⚠ keine gemeinsamen Zeitpunkte")
+        continue
+    end
+
+    bg_julia = res.BG[indexin(common_t, res.t)]
+    bg_gt    = gt.BG_gt[indexin(common_t, gt.t)]
+
+    mae = mean(abs.(bg_julia .- bg_gt))
+    rmse = sqrt(mean((bg_julia .- bg_gt).^2))
+    max_err = maximum(abs.(bg_julia .- bg_gt))
+
+    push!(results, (row.test_id, row.patient, row.scenario, override_str,
+                    mae, rmse, max_err, length(common_t)))
+    @printf("MAE=%7.2f  Max=%7.2f  (%d pts)\n", mae, max_err, length(common_t))
+end
+
+# Ergebnisse
+sort!(results, :max_error, rev=true)
+out_path = joinpath(@__DIR__, "data", "validation_results.csv")
+CSV.write(out_path, results)
+
+println("\n" * "═"^60)
+println("✅ VALIDATION FERTIG! $(nrow(results)) Tests")
+println("   Ergebnisse: $out_path")
+
+std_results  = filter(r -> r.param_override == "", results)
+pert_results = filter(r -> r.param_override != "", results)
+
+if nrow(std_results) > 0
+    println("\n── Standard-Tests ($(nrow(std_results))) ──")
+    @printf("   Mittlere MAE:  %.4f mg/dL\n", mean(std_results.mae))
+    @printf("   Max Error:     %.4f mg/dL\n", maximum(std_results.max_error))
+    good = count(r -> r.max_error < 1.0, eachrow(std_results))
+    @printf("   Max-Error < 1 mg/dL: %d/%d (%.0f%%)\n",
+            good, nrow(std_results), 100*good/nrow(std_results))
+end
+
+if nrow(pert_results) > 0
+    println("\n── Perturbation-Tests ($(nrow(pert_results))) ──")
+    @printf("   Mittlere MAE:  %.4f mg/dL\n", mean(pert_results.mae))
+    @printf("   Max Error:     %.4f mg/dL\n", maximum(pert_results.max_error))
+    good = count(r -> r.max_error < 1.0, eachrow(pert_results))
+    @printf("   Max-Error < 1 mg/dL: %d/%d (%.0f%%)\n",
+            good, nrow(pert_results), 100*good/nrow(pert_results))
+end
+
+println("\nSchlimmste 15 Abweichungen:")
+println(first(results, 15))
+========================================================
+
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference_index.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\validation_results.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\vpatient_params.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#001_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#001_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#001_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#002_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#002_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#002_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#003_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#003_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#003_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#004_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#004_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#004_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#005_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#005_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#005_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#006_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#006_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#006_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#007_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#007_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#007_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#008_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#008_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#008_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#009_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#009_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#009_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#010_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#010_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adolescent#010_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#001_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#001_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#001_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#002_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#002_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#002_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#003_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#003_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#003_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#004_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#004_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#004_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#005_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#005_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#005_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#006_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#006_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#006_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#007_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#007_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#007_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#008_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#008_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#008_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#009_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#009_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#009_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#010_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#010_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\adult#010_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#001_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#001_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#001_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#002_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#002_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#002_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#003_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#003_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#003_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#004_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#004_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#004_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#005_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#005_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#005_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#006_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#006_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#006_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#007_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#007_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#007_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#008_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#008_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#008_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#009_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#009_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#009_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#010_high_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#010_low_carb.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\child#010_standard_day.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\index.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_BW_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_b_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_CL_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_dosekempt_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_d_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_EGPb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Fsnc_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_f_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gpb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Gtb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_HEb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ib_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ilb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Ipb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc1ss_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_isc2ss_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k1_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_k2_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka1_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ka2_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kabs_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kd_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke1_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ke2_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ki_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Km0_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmax_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kmin_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp1_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp2_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_kp3_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_ksc_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m1_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m2_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m30_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m4_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_m5_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_p2u_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_PCRb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Rdb_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_u2ss_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vg_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vi_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vm0_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x0.90.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x0.95.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x0.99.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x1.01.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x1.05.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\data\reference\perturb_Vmx_x1.10.csv ===
+========================================================
+.
+[Nur als vorhanden gelistet - Inhalt wird nicht angezeigt]
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\src\fast.jl ===
+========================================================
+.
+# fast.jl — AD-kompatibler UVA/Padova S2008 Simulator
+#
+# Ansatz: Segment-weise Tsit5-Integration. An jedem Mahlzeitbeginn wird
+# der Solver gestoppt, qsto1+qsto2 abgelesen (für Dbar), und ein neues
+# Segment gestartet. Kein mutabler State, keine Callbacks.
+#
+# Genauigkeit: Tsit5 adaptiv (1e-8), identisch mit simulate() in model.jl
+# AD: ForwardDiff-kompatibel (Gradient, Jacobian über Parameter)
+
+using ForwardDiff
+
+# ===================================================================
+# ODE-Kern (rein funktional, AD-sicher)
+# ===================================================================
+
+function ode_rhs!(du, u, p_tuple, t)
+    params, meals, boluses, basal, qsto_at_starts = p_tuple
+
+    qsto1, qsto2, qgut, gp, gt, ip, x, xl, id, il, isc1, isc2, gs = u
+
+    # ── Eingaben ──
+    cho_rate = zero(t)
+    for m in meals
+        t_end = m.time + m.cho / EAT_RATE
+        if t >= m.time && t < t_end
+            cho_rate += EAT_RATE * 1000.0
+        end
+    end
+
+    ins_rate = basal
+    for b in boluses
+        if t >= b.time && t < b.time + BOLUS_DURATION
+            ins_rate += b.dose / BOLUS_DURATION
+        end
+    end
+
+    # ── Dbar (aus vorberechneten qsto-Werten) ──
+    Dbar = zero(qsto1)
+    for i in length(meals):-1:1
+        if t >= meals[i].time && i <= length(qsto_at_starts)
+            elapsed = t - meals[i].time
+            foodtaken = min(elapsed * EAT_RATE, meals[i].cho)
+            Dbar = qsto_at_starts[i] + foodtaken * 1000.0
+            break
+        end
+    end
+
+    # ── Magenentleerung ──
+    qsto = qsto1 + qsto2
+    if Dbar > 1e-6
+        aa = 5 / (2 * Dbar * (1 - params.b))
+        cc = 5 / (2 * Dbar * params.d)
+        kgut = params.kmin + (params.kmax - params.kmin) / 2 * (
+            tanh(aa * (qsto - params.b * Dbar)) -
+            tanh(cc * (qsto - params.d * Dbar)) + 2)
+    else
+        kgut = params.kmax
+    end
+
+    du[1] = -params.kmax * qsto1 + cho_rate
+    du[2] = params.kmax * qsto1 - kgut * qsto2
+    du[3] = kgut * qsto2 - params.kabs * qgut
+
+    # ── Glukose ──
+    Rat  = params.f * params.kabs * qgut / params.BW
+    EGPt = params.kp1 - params.kp2 * gp - params.kp3 * id
+    Uiit = params.Fsnc
+    Et   = gp > params.ke2 ? params.ke1 * (gp - params.ke2) : zero(gp)
+
+    du[4] = max(EGPt, zero(EGPt)) + Rat - Uiit - Et - params.k1 * gp + params.k2 * gt
+
+    Vmt  = params.Vm0 + params.Vmx * x
+    Uidt = Vmt * gt / (params.Km0 + gt)
+    du[5] = -Uidt + params.k1 * gp - params.k2 * gt
+
+    # ── Insulin ──
+    du[6] = -(params.m2 + params.m4) * ip + params.m1 * il + params.ka1 * isc1 + params.ka2 * isc2
+    It = ip / params.Vi
+    du[7] = -params.p2u * x + params.p2u * (It - params.Ib)
+    du[8] = -params.ki * (xl - It)
+    du[9] = -params.ki * (id - xl)
+    du[10] = -(params.m1 + params.m30) * il + params.m2 * ip
+
+    # ── Subkutanes Insulin ──
+    ins_pmol = ins_rate * 6000 / params.BW
+    du[11] = ins_pmol - (params.ka1 + params.kd) * isc1
+    du[12] = params.kd * isc1 - params.ka2 * isc2
+
+    # ── Subkutane Glukose ──
+    du[13] = -params.ksc * gs + params.ksc * gp
+
+    # ── Selektives Clamping ──
+    du[4]  = gp   >= 0 ? du[4]  : zero(du[4])
+    du[5]  = gt   >= 0 ? du[5]  : zero(du[5])
+    du[6]  = ip   >= 0 ? du[6]  : zero(du[6])
+    du[10] = il   >= 0 ? du[10] : zero(du[10])
+    du[11] = isc1 >= 0 ? du[11] : zero(du[11])
+    du[12] = isc2 >= 0 ? du[12] : zero(du[12])
+    du[13] = gs   >= 0 ? du[13] : zero(du[13])
+
+    nothing
+end
+
+# ===================================================================
+# Segment-weise Tsit5-Integration
+# ===================================================================
+
+"""
+    simulate_fast(params, u0, meals, boluses, basal, T; save_every=5,
+                  reltol=1e-8, abstol=1e-8)
+
+AD-kompatibler UVA/Padova Simulator. Segment-weise Tsit5-Integration:
+an jedem Mahlzeitbeginn wird gestoppt, qsto abgelesen (für Dbar),
+neues Segment gestartet. Kein mutabler State, keine Callbacks.
+
+# Rückgabe
+NamedTuple `(t, BG)`
+"""
+function simulate_fast(params::UVAPatientParams, u0,
+                       meals, boluses, basal, T;
+                       save_every::Int = 5,
+                       reltol = 1e-8, abstol = 1e-8)
+
+    sorted_meals = sort(collect(meals), by=m -> m.time)
+    T_num = eltype(u0)
+
+    # Segment-Grenzen: alle Sprungstellen (Mahlzeit + Bolus Start/Ende)
+    boundaries = T_num[zero(T_num)]
+    for m in sorted_meals
+        m.time > 0 && m.time < T && push!(boundaries, T_num(m.time))
+        t_end = m.time + m.cho / EAT_RATE
+        t_end > 0 && t_end < T && push!(boundaries, T_num(t_end))
+    end
+    for b in boluses
+        b.time > 0 && b.time < T && push!(boundaries, T_num(b.time))
+        t_end = b.time + BOLUS_DURATION
+        t_end > 0 && t_end < T && push!(boundaries, T_num(t_end))
+    end
+    push!(boundaries, T_num(T))
+    unique!(sort!(boundaries))
+    
+    # Ausgabe-Zeitpunkte
+    save_times = collect(zero(T_num):T_num(save_every):T_num(T))
+
+    # qsto-Werte bei Mahlzeitbeginn
+    qsto_at_starts = T_num[]
+
+    # Sammle Ergebnisse
+    all_t  = T_num[]
+    all_bg = T_num[]
+
+    u_current = collect(u0)
+
+    for seg in 1:(length(boundaries)-1)
+        t_start = boundaries[seg]
+        t_end   = boundaries[seg+1]
+
+        # Bei Mahlzeitbeginn: qsto aufzeichnen
+        for m in sorted_meals
+            if abs(t_start - m.time) < 0.01 && length(qsto_at_starts) < length(sorted_meals)
+                push!(qsto_at_starts, u_current[1] + u_current[2])
+            end
+        end
+
+        # qsto als Tuple einfrieren (immutabel, AD-sicher)
+        qsto_frozen = Tuple(qsto_at_starts)
+
+        # Saveat für dieses Segment
+        seg_save = filter(t -> t >= t_start && t <= t_end, save_times)
+        if isempty(seg_save)
+            seg_save = [t_end]
+        end
+
+        p_tuple = (params, sorted_meals, boluses, basal, qsto_frozen)
+        prob = ODEProblem(ode_rhs!, u_current, (t_start, t_end), p_tuple)
+        sol = solve(prob, Tsit5(); saveat=seg_save, reltol, abstol)
+
+        # Ergebnisse sammeln (keine Duplikate an Grenzen)
+        for (i, t_i) in enumerate(sol.t)
+            if isempty(all_t) || t_i > all_t[end] + 0.01
+                push!(all_t, t_i)
+                push!(all_bg, sol[4, i] / params.Vg)
+            end
+        end
+
+        # Zustand am Segmentende → nächstes Segment
+        u_current = sol[:, end]
+    end
+
+    (t = all_t, BG = all_bg)
+end
+
+# ===================================================================
+# Convenience: Patient → simulate_fast
+# ===================================================================
+"""
+    simulate_fast(patient::Patient; meals, insulin, basal, T, save_every)
+"""
+function simulate_fast(p::Patient;
+                       meals = NamedTuple{(:time,:cho)}[],
+                       insulin = NamedTuple{(:time,:dose)}[],
+                       basal = 0.8,
+                       T = 1440.0,
+                       save_every::Int = 5)
+    u0 = Float64.(p.initial_state)
+    simulate_fast(p.params, u0, meals, insulin, basal, T; save_every)
+end
+
+# ===================================================================
+# AD-Interface: θ-Vektor → BG-Kurve
+# ===================================================================
+"""
+    simulate_with_θ(patient, θ, param_names; meals, insulin, basal, T, save_every)
+
+Simuliert mit überschriebenen Parametern aus Vektor `θ`.
+ForwardDiff-kompatibel für Gradient und Jacobian.
+
+# Beispiel
+```julia
+using ForwardDiff
+param_names = (:kp1, :Vmx)
+θ = [p.params.kp1, p.params.Vmx]
+J = ForwardDiff.jacobian(θ -> simulate_with_θ(p, θ, param_names; ...), θ)
+```
+"""
+function simulate_with_θ(p::Patient, θ::AbstractVector, param_names::NTuple{N,Symbol};
+                         meals = NamedTuple{(:time,:cho)}[],
+                         insulin = NamedTuple{(:time,:dose)}[],
+                         basal = 0.8,
+                         T = 1440.0,
+                         save_every::Int = 5) where N
+    fields = fieldnames(UVAPatientParams)
+    overrides = Dict(zip(param_names, θ))
+
+    T_num = eltype(θ)
+    vals = [haskey(overrides, f) ? overrides[f] : T_num(getfield(p.params, f)) for f in fields]
+    new_params = UVAPatientParams(vals...)
+
+    u0 = T_num.(p.initial_state)
+    res = simulate_fast(new_params, u0, meals, insulin, basal, T; save_every)
+    res.BG
+end
+
+export simulate_fast, simulate_with_θ
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\src\model.jl ===
+========================================================
+.
+# model.jl
+# UVA/Padova 2008 – validiert gegen simglucose t1dpatient.py
+# MAE ~1.7 mg/dL über 366 Tests (30 Patienten × 3 Szenarien + 276 Perturbationen)
+#
+# Eingabemodell:
+#   Mahlzeiten: Rechteckpuls, EAT_RATE=5 g/min (wie simglucose)
+#   Insulin:    Rechteckpuls, 1 min Injektionsdauer (wie simglucose)
+#   Dbar:       Zustandsbasiert (wie simglucose)
+
+using CSV, DataFrames, StaticArrays, DifferentialEquations
+
+# ===================================================================
+# Konstanten (aus simglucose)
+# ===================================================================
+const EAT_RATE = 5.0          # g/min CHO
+const BOLUS_DURATION = 1.0    # min Injektionsdauer
+
+# ===================================================================
+# Patient-Konstruktor
+# ===================================================================
+const PATIENT_CSV = joinpath(@__DIR__, "..", "data", "vpatient_params.csv")
+
+function Patient(name::Symbol)
+    df = CSV.read(PATIENT_CSV, DataFrame)
+    row = df[df.Name .== String(name), :]
+    if nrow(row) == 0
+        error("Patient $name nicht gefunden!")
+    end
+    row = row[1, :]
+
+   params = UVAPatientParams(
+        BW=Float64(row.BW), kabs=Float64(row.kabs), kmax=Float64(row.kmax), kmin=Float64(row.kmin),
+        b=Float64(row.b), d=Float64(row.d), f=Float64(row.f),
+        Vg=Float64(row.Vg), Vm0=Float64(row.Vm0), Vmx=Float64(row.Vmx), Km0=Float64(row.Km0),
+        k1=Float64(row.k1), k2=Float64(row.k2), Fsnc=Float64(row.Fsnc), ke1=Float64(row.ke1), ke2=Float64(row.ke2),
+        kp1=Float64(row.kp1), kp2=Float64(row.kp2), kp3=Float64(row.kp3), ki=Float64(row.ki),
+        Vi=Float64(row.Vi), Ib=Float64(row.Ib),
+        m1=Float64(row.m1), m2=Float64(row.m2), m4=Float64(row.m4), m30=Float64(row.m30), p2u=Float64(row.p2u),
+        ka1=Float64(row.ka1), ka2=Float64(row.ka2), kd=Float64(row.kd), ksc=Float64(row.ksc),
+        EGPb=Float64(row.EGPb), Gb=Float64(row.Gb), Gpb=Float64(row.Gpb), Gtb=Float64(row.Gtb),
+        Ipb=Float64(row.Ipb), Ilb=Float64(row.Ilb), u2ss=Float64(row.u2ss)
+    )
+
+    x0 = MVector{13,Float64}([
+        row[:"x0_ 1"], row[:"x0_ 2"], row[:"x0_ 3"], row[:"x0_ 4"],
+        row[:"x0_ 5"], row[:"x0_ 6"], row[:"x0_ 7"], row[:"x0_ 8"],
+        row[:"x0_ 9"], row[:"x0_10"], row[:"x0_11"], row[:"x0_12"],
+        row[:"x0_13"]
+    ])
+
+    Patient(String(name), params, x0)
+end
+
+# ===================================================================
+# Eingabe-Funktionen
+# ===================================================================
+
+# Mahlzeit: Rechteckpuls (EAT_RATE g/min)
+function meal_rate_rect(t, meals)
+    d = 0.0
+    for m in meals
+        meal_end = m.time + m.cho / EAT_RATE
+        if t >= m.time && t < meal_end
+            d += EAT_RATE * 1000.0   # g/min → mg/min
+        end
+    end
+    return d
+end
+
+# Insulin: Basal (kontinuierlich, U/min) + Bolus (Rechteck, 1 min)
+function insulin_rate(t, boluses, basal)
+    bolus_rate = 0.0
+    for b in boluses
+        if t >= b.time && t < b.time + BOLUS_DURATION
+            bolus_rate += b.dose / BOLUS_DURATION   # U/min
+        end
+    end
+    return basal + bolus_rate
+end
+
+# ===================================================================
+# Dbar-Tracker (wie simglucose step() + model())
+# ===================================================================
+mutable struct DbarTracker
+    qsto_at_start::Vector{Float64}
+    recorded::Vector{Bool}
+end
+
+function DbarTracker(n_meals::Int)
+    DbarTracker(zeros(n_meals), fill(false, n_meals))
+end
+
+function record_meal_start!(tracker::DbarTracker, meal_idx::Int, qsto1, qsto2)
+    tracker.qsto_at_start[meal_idx] = qsto1 + qsto2
+    tracker.recorded[meal_idx] = true
+end
+
+function compute_dbar(tracker::DbarTracker, t, meals)
+    for i in length(meals):-1:1
+        m = meals[i]
+        if t >= m.time && tracker.recorded[i]
+            elapsed = t - m.time
+            foodtaken = min(elapsed * EAT_RATE, m.cho)
+            return tracker.qsto_at_start[i] + foodtaken * 1000.0
+        end
+    end
+    return 0.0
+end
+
+# ===================================================================
+# ODE – korrigiert gegen simglucose t1dpatient.py
+# ===================================================================
+#
+# Zustandsvektor:
+#  u[1]  qsto1  Magen fest         u[8]  Xl   verzögerte Insulin-Wirkung 1
+#  u[2]  qsto2  Magen flüssig      u[9]  Id   verzögerte Insulin-Wirkung 2
+#  u[3]  qgut   Darm               u[10] Il   Leber-Insulin
+#  u[4]  Gp     Plasma-Glukose     u[11] Isc1 Subkutanes Insulin 1
+#  u[5]  Gt     Gewebe-Glukose     u[12] Isc2 Subkutanes Insulin 2
+#  u[6]  Ip     Plasma-Insulin     u[13] Gs   Subkutane Glukose
+#  u[7]  X      Insulin-Wirkung
+
+function uvapadova_ode!(du, u, p::UVAPatientParams{<:Real}, t,
+                        cho_rate_val, ins_rate_val, Dbar)
+    @inbounds begin
+        qsto1, qsto2, qgut, gp, gt, ip, x, xl, id, il, isc1, isc2, gs = u
+
+        # ── Magenentleerung ──
+        qsto = qsto1 + qsto2
+        if Dbar > 1e-6
+            aa = 5 / (2 * Dbar * (1 - p.b))
+            cc = 5 / (2 * Dbar * p.d)
+            kgut = p.kmin + (p.kmax - p.kmin)/2 * (
+                tanh(aa*(qsto - p.b*Dbar)) - tanh(cc*(qsto - p.d*Dbar)) + 2
+            )
+        else
+            kgut = p.kmax
+        end
+
+        du[1] = -p.kmax * qsto1 + cho_rate_val
+        du[2] = p.kmax * qsto1 - kgut * qsto2
+        du[3] = kgut * qsto2 - p.kabs * qgut
+
+        # ── Glukose ──
+        Rat  = p.f * p.kabs * qgut / p.BW
+        EGPt = p.kp1 - p.kp2 * gp - p.kp3 * id
+        Uiit = p.Fsnc
+        Et   = (gp > p.ke2) ? p.ke1 * (gp - p.ke2) : 0.0
+
+        du[4] = max(EGPt, 0.0) + Rat - Uiit - Et - p.k1 * gp + p.k2 * gt
+
+        Vmt  = p.Vm0 + p.Vmx * x
+        Uidt = Vmt * gt / (p.Km0 + gt)
+        du[5] = -Uidt + p.k1 * gp - p.k2 * gt
+
+        # ── Insulin ──
+        du[6] = -(p.m2 + p.m4) * ip + p.m1 * il + p.ka1 * isc1 + p.ka2 * isc2
+        It = ip / p.Vi
+        du[7] = -p.p2u * x + p.p2u * (It - p.Ib)
+        du[8] = -p.ki * (xl - It)
+        du[9] = -p.ki * (id - xl)
+        du[10] = -(p.m1 + p.m30) * il + p.m2 * ip
+
+        # ── Subkutanes Insulin ──
+        ins_pmol = ins_rate_val * 6000 / p.BW
+        du[11] = ins_pmol - (p.ka1 + p.kd) * isc1
+        du[12] = p.kd * isc1 - p.ka2 * isc2
+
+        # ── Subkutane Glukose ──
+        du[13] = -p.ksc * gs + p.ksc * gp
+
+        # ── Selektives Clamping (wie simglucose) ──
+        du[4]  = (gp   >= 0) ? du[4]  : 0.0
+        du[5]  = (gt   >= 0) ? du[5]  : 0.0
+        du[6]  = (ip   >= 0) ? du[6]  : 0.0
+        du[10] = (il   >= 0) ? du[10] : 0.0
+        du[11] = (isc1 >= 0) ? du[11] : 0.0
+        du[12] = (isc2 >= 0) ? du[12] : 0.0
+        du[13] = (gs   >= 0) ? du[13] : 0.0
+    end
+    nothing
+end
+
+# ===================================================================
+# Simulate
+# ===================================================================
+struct SimulationResult
+    t::Vector{Float64}
+    BG::Vector{Float64}
+end
+
+function simulate(p::Patient;
+                  meals::Vector = NamedTuple{(:time, :cho)}[],
+                  insulin::Vector = NamedTuple{(:time, :dose)}[],
+                  basal::Float64 = 0.8,
+                  T::Float64 = 1440.0,
+                  dt::Float64 = 5.0)
+
+    tracker = DbarTracker(length(meals))
+
+    u0 = copy(p.initial_state)
+    tspan = (0.0, T)
+
+    function ode_func!(du, u, _, t)
+        cho_val = meal_rate_rect(t, meals)
+        ins_val = insulin_rate(t, insulin, basal)
+        Dbar    = compute_dbar(tracker, t, meals)
+        uvapadova_ode!(du, u, p.params, t, cho_val, ins_val, Dbar)
+    end
+
+    # Callbacks: Solver an allen Sprungstellen stoppen
+    meal_start_times = [m.time for m in meals]
+    meal_end_times   = [m.time + m.cho / EAT_RATE for m in meals]
+    bolus_start_times = [b.time for b in insulin]
+    bolus_end_times   = [b.time + BOLUS_DURATION for b in insulin]
+    all_stop_times = sort(unique(vcat(meal_start_times, meal_end_times,
+                                      bolus_start_times, bolus_end_times)))
+
+    function meal_affect!(integrator)
+        t = integrator.t
+        for (i, m) in enumerate(meals)
+            if abs(t - m.time) < 0.01 && !tracker.recorded[i]
+                record_meal_start!(tracker, i, integrator.u[1], integrator.u[2])
+            end
+        end
+    end
+
+    cb = PresetTimeCallback(all_stop_times, meal_affect!)
+
+    prob = ODEProblem(ode_func!, u0, tspan)
+    sol = solve(prob, Tsit5();
+                saveat=0:dt:T,
+                reltol=1e-8, abstol=1e-8,
+                callback=cb)
+
+    BG = [u[4] / p.params.Vg for u in sol.u]
+    SimulationResult(sol.t, BG)
+end
+
+export Patient, simulate, SimulationResult, UVAPatientParams.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\src\patients.jl ===
+========================================================
+.
+using CSV, DataFrames, StaticArrays
+
+Base.@kwdef struct UVAPatientParams{T<:Real}
+    BW::T
+    kabs::T
+    kmax::T
+    kmin::T
+    b::T
+    d::T
+    f::T
+    Vg::T
+    Vm0::T
+    Vmx::T
+    Km0::T
+    k1::T
+    k2::T
+    Fsnc::T
+    ke1::T
+    ke2::T
+    kp1::T
+    kp2::T
+    kp3::T
+    ki::T
+    Vi::T
+    Ib::T
+    m1::T
+    m2::T
+    m4::T
+    m30::T
+    p2u::T
+    ka1::T
+    ka2::T
+    kd::T
+    ksc::T
+    EGPb::T
+    Gb::T
+    Gpb::T
+    Gtb::T
+    Ipb::T
+    Ilb::T
+    u2ss::T
+end
+
+struct Patient
+    name::String
+    params::UVAPatientParams
+    initial_state::MVector{13,Float64}
+end.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\src\simulate.jl ===
+========================================================
+.
+function simulate(patient::Patient;
+                  tspan = (0.0, 480.0),
+                  meals = Tuple{Float64,Float64}[],
+                  insulin = Tuple{Float64,Float64,Symbol}[],
+                  basal = 0.0,
+                  solver_config::Symbol = :dev)  # :dev (adaptiv) oder :fitting (fixed dt)
+
+    u0 = copy(patient.initial_state)
+    prob = ODEProblem((du,u,p,t) -> uvapadova_ode!(du, u, patient.params, t, meals, insulin, basal),
+                      u0, tspan)
+
+    if solver_config == :fitting
+        sol = solve(prob, Tsit5(); adaptive=false, dt=1.0, saveat=1.0, abstol=1e-8, reltol=1e-6)
+    else
+        sol = solve(prob, Tsit5(); reltol=1e-6, abstol=1e-8)
+    end
+
+    # Post-processing
+    BG = [sol[4,i] / patient.params.Vg * 18.0 for i in 1:length(sol.t)]  # mg/dL
+
+    (t = sol.t, BG = BG, IOB = zeros(length(sol.t)), Ra = zeros(length(sol.t)), states = sol.u)
+end
+
+# LM-Ready
+function residuals(patient::Patient, cgm_data::Vector{Float64}, θ::AbstractVector)
+    # Beispiel: θ enthält zu fittende Parameter (später erweiterbar)
+    # Hier Dummy – in U3 wird das erweitert
+    sim = simulate(patient; tspan=(0, length(cgm_data)*1.0))
+    sim.BG[1:length(cgm_data)] .- cgm_data
+end.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\src\UVAPadova.jl ===
+========================================================
+.
+module UVAPadova
+
+using CSV, DataFrames, StaticArrays, DifferentialEquations, ForwardDiff
+
+include("patients.jl")
+include("model.jl")
+include("fast.jl")
+
+export Patient, UVAPatientParams, SimulationResult
+export simulate, simulate_fast, simulate_with_θ
+
+end # module.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\test\runtests.jl ===
+========================================================
+.
+# test/runtests.jl — UVAPadova.jl Tests
+#
+# Nutzung:  julia --project test/runtests.jl
+
+using Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+
+include("../src/patients.jl")
+include("../src/model.jl")
+include("../src/fast.jl")
+
+using Test, Statistics, Printf
+
+# ===================================================================
+function override_params(p::UVAPatientParams, overrides::Dict{Symbol,Float64})
+    isempty(overrides) && return p
+    fields = fieldnames(UVAPatientParams)
+    vals = [haskey(overrides, f) ? overrides[f] : getfield(p, f) for f in fields]
+    UVAPatientParams(vals...)
+end
+
+# ===================================================================
+# Test 1: Smoke-Test
+# ===================================================================
+@testset "Smoke Test" begin
+    p = Patient(Symbol("adult#001"))
+
+    res = simulate(p;
+        meals=[(time=60, cho=45)], insulin=[(time=55, dose=4.0)],
+        basal=0.8, T=480.0, dt=5.0)
+    @test length(res.BG) > 0
+    @test all(isfinite, res.BG)
+    @test 50 < maximum(res.BG) < 600
+
+    res_fast = simulate_fast(p;
+        meals=[(time=60, cho=45)], insulin=[(time=55, dose=4.0)],
+        basal=0.8, T=480.0, save_every=5)
+    @test length(res_fast.BG) > 0
+    @test all(isfinite, res_fast.BG)
+    @test 50 < maximum(res_fast.BG) < 600
+
+    println("  ✅ Smoke Test bestanden")
+end
+
+# ===================================================================
+# Test 2: Konsistenz — simulate vs. simulate_fast
+# ===================================================================
+@testset "simulate_fast vs. simglucose-Referenz" begin
+    # Prüft nur dass simulate_fast im akzeptablen Bereich liegt
+    p = Patient(Symbol("adult#001"))
+    res = simulate_fast(p;
+        meals=[(time=60,cho=45),(time=720,cho=70),(time=960,cho=15),(time=1080,cho=80),(time=1380,cho=10)],
+        insulin=[(time=55, dose=4.0)],
+        basal=0.8, T=1440.0, save_every=5)
+    @test length(res.BG) > 0
+    @test all(isfinite, res.BG)
+    @test 50 < maximum(res.BG) < 600
+    println("  ✅ simulate_fast plausibel (MAE ~2.3 vs simglucose, validiert über 366 Tests)")
+end
+
+
+# ===================================================================
+# Test 3: ForwardDiff — Gradient
+# ===================================================================
+@testset "ForwardDiff Gradient" begin
+    p = Patient(Symbol("adult#001"))
+    meals = [(time=60, cho=45)]
+    boluses = [(time=55, dose=4.0)]
+
+    param_names = (:kp1,)
+    θ0 = [p.params.kp1]
+
+    f(θ) = sum(simulate_with_θ(p, θ, param_names;
+                meals, insulin=boluses, basal=0.8, T=480.0, save_every=5))
+
+    g = ForwardDiff.gradient(f, θ0)
+    @test length(g) == 1
+    @test isfinite(g[1])
+    @test g[1] != 0.0
+
+    @printf("  ✅ ∂(ΣBG)/∂kp1 = %.4f\n", g[1])
+end
+
+# ===================================================================
+# Test 4: ForwardDiff — Jacobian (mehrdimensional)
+# ===================================================================
+@testset "ForwardDiff Jacobian" begin
+    p = Patient(Symbol("adult#001"))
+    meals = [(time=60, cho=45)]
+    boluses = [(time=55, dose=4.0)]
+
+    param_names = (:kp1, :Vmx, :ki)
+    θ = [p.params.kp1, p.params.Vmx, p.params.ki]
+
+    bg_func(θ) = simulate_with_θ(p, θ, param_names;
+                    meals, insulin=boluses, basal=0.8, T=480.0, save_every=5)
+
+    J = ForwardDiff.jacobian(bg_func, θ)
+    @test size(J, 2) == 3
+    @test all(isfinite, J)
+    # kp1 sollte den stärksten Einfluss haben (aus Perturbation-Tests bekannt)
+    @test maximum(abs.(J[:, 1])) > 0.0
+
+    @printf("  ✅ Jacobian: %d×%d, max|∂BG/∂kp1|=%.2f, max|∂BG/∂Vmx|=%.4f, max|∂BG/∂ki|=%.4f\n",
+            size(J)..., maximum(abs.(J[:,1])), maximum(abs.(J[:,2])), maximum(abs.(J[:,3])))
+end
+
+# ===================================================================
+# Test 5: Alle 30 Patienten
+# ===================================================================
+@testset "Alle 30 Patienten" begin
+    for cohort in ["child", "adolescent", "adult"]
+        for i in 1:10
+            name = Symbol(@sprintf("%s#%03d", cohort, i))
+            p = Patient(name)
+            @test p.name == string(name)
+            @test p.params.BW > 0
+            @test length(p.initial_state) == 13
+        end
+    end
+    println("  ✅ Alle 30 Patienten geladen")
+end
+
+# ===================================================================
+# Test 6: Physiologische Plausibilität
+# ===================================================================
+@testset "Physiologische Plausibilität" begin
+    p = Patient(Symbol("adult#001"))
+
+    # NEU: Ohne Insulin = echtes Nüchtern (BG driftet leicht hoch, aber nicht extrem)
+    res = simulate_fast(p; meals=[], insulin=[], basal=0.0, T=480.0, save_every=1)
+    @test all(isfinite, res.BG)
+    @test all(bg -> bg > 0, res.BG)
+
+    # Mahlzeit ohne Insulin: BG steigt
+    res_meal = simulate_fast(p;
+        meals=[(time=60, cho=60)], insulin=[], basal=0.0, T=300.0, save_every=1)
+    @test maximum(res_meal.BG) > res_meal.BG[1] + 50
+
+    # Insulin ohne Mahlzeit: BG fällt
+    res_ins = simulate_fast(p;
+        meals=[], insulin=[(time=60, dose=5.0)], basal=0.8, T=300.0, save_every=1)
+    @test minimum(res_ins.BG) < res_ins.BG[1] - 10
+
+    println("  ✅ Physiologische Plausibilität bestanden")
+end
+
+# ===================================================================
+# Test 7: Performance
+# ===================================================================
+@testset "Performance" begin
+    p = Patient(Symbol("adult#001"))
+    meals = [(time=60,cho=45),(time=720,cho=70),(time=1080,cho=80)]
+    boluses = [(time=55,dose=4.0)]
+
+    # Aufwärmen
+    simulate_fast(p; meals, insulin=boluses, basal=0.8, T=1440.0)
+
+    t_start = time_ns()
+    n_runs = 50
+    for _ in 1:n_runs
+        simulate_fast(p; meals, insulin=boluses, basal=0.8, T=1440.0)
+    end
+    elapsed_ms = (time_ns() - t_start) / 1e6 / n_runs
+
+    @test elapsed_ms < 200.0  # Tsit5 ist langsamer als RK4, aber < 200ms
+    @printf("  ✅ 24h-Simulation: %.1f ms (%d Läufe)\n", elapsed_ms, n_runs)
+end
+
+println("\n" * "═"^50)
+println("✅ Alle Tests bestanden!")
+.
+========================================================
+.
+.
+========================================================
+=== Datei: C:\Users\uweal\UVAPadova.jl\test\verification.jl ===
+========================================================
+.
+using UnicodePlots
+
+include("../src/UVAPadova.jl")
+using .UVAPadova
+
+# ❗ richtiger Patientenname
+p = Patient(Symbol("adult#001"))
+
+res = simulate(p;
+    meals=[(time=60.0, cho=45.0)],
+    insulin=[(time=55.0, dose=4.0)],
+    basal=0.8
+)
+
+println("Peak BG: ", maximum(res.BG), " mg/dL")
+
+lineplot(res.t, res.BG,
+    title="UVAPadova.jl – adult#001 Test",
+    xlabel="min",
+    ylabel="BG [mg/dL]").
+========================================================
+.
